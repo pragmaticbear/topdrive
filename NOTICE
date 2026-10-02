@@ -1,0 +1,9 @@
+topdrive
+Copyright 2026 Brandon Fitzgerald
+
+This product began as part of a fork of OpenRig (https://github.com/mvschwarz/openrig),
+Copyright 2026 Mike Schwarz, licensed under the Apache License, Version 2.0.
+Portions of topdrive's routing core were first written inside that fork.
+
+The patch in openrig-patches/ modifies OpenRig source and is likewise licensed under
+the Apache License, Version 2.0.

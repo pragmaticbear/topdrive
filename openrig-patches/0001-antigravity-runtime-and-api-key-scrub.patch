@@ -1,0 +1,1266 @@
+diff --git a/packages/daemon/src/adapters/antigravity-conversation.ts b/packages/daemon/src/adapters/antigravity-conversation.ts
+new file mode 100644
+index 0000000..fe907cc
+--- /dev/null
++++ b/packages/daemon/src/adapters/antigravity-conversation.ts
+@@ -0,0 +1,48 @@
++// topdrive: the agy conversation id of a live seat, read from the OS: the `agy` process holds its own
++// conversation DB (<uuid>.db/-wal/-shm/.lock) open. Exact per seat even with several agy seats, unlike a
++// before/after directory diff. Read-only (ps/lsof); never guesses: zero or several conversations => a skip reason.
++
++export type AgyConversationRead =
++  | { ok: true; conversationId: string }
++  | { ok: false; reason: "no_agy_process" | "not_yet_created" | "ambiguous" | "probe_failed" };
++
++const CONVERSATION_FILE = /\/conversations\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(?:db|db-wal|db-shm|lock)$/;
++
++/** Distinct conversation uuids named in `lsof -Fn` output (conversation_summaries.db never matches). */
++export function parseLsofConversationIds(lsofFn: string): string[] {
++  const ids = new Set<string>();
++  for (const line of lsofFn.split("\n")) {
++    if (!line.startsWith("n")) continue;
++    const m = CONVERSATION_FILE.exec(line.slice(1));
++    if (m) ids.add(m[1]!);
++  }
++  return [...ids];
++}
++
++export interface AgyConversationProbe {
++  panePid: () => Promise<number | null>;
++  children: (pid: number) => Promise<number[]>;
++  comm: (pid: number) => Promise<string>;
++  lsof: (pid: number) => Promise<string>;
++}
++
++export async function readAgyConversationId(p: AgyConversationProbe): Promise<AgyConversationRead> {
++  try {
++    const root = await p.panePid();
++    if (root === null) return { ok: false, reason: "no_agy_process" };
++    // The pane runs a shell with agy as a child (managed seats) or agy directly; look at the pane process and descendants (depth <= 3).
++    let frontier = [root];
++    let agyPid: number | null = null;
++    for (let depth = 0; depth < 4 && agyPid === null && frontier.length; depth++) {
++      for (const pid of frontier) if ((await p.comm(pid)).split("/").pop() === "agy") { agyPid = pid; break; }
++      if (agyPid === null) frontier = (await Promise.all(frontier.map((pid) => p.children(pid)))).flat();
++    }
++    if (agyPid === null) return { ok: false, reason: "no_agy_process" };
++    const ids = parseLsofConversationIds(await p.lsof(agyPid));
++    if (ids.length === 0) return { ok: false, reason: "not_yet_created" };
++    if (ids.length > 1) return { ok: false, reason: "ambiguous" };
++    return { ok: true, conversationId: ids[0]! };
++  } catch {
++    return { ok: false, reason: "probe_failed" };
++  }
++}
+diff --git a/packages/daemon/src/adapters/antigravity-resume.ts b/packages/daemon/src/adapters/antigravity-resume.ts
+new file mode 100644
+index 0000000..8670dd2
+--- /dev/null
++++ b/packages/daemon/src/adapters/antigravity-resume.ts
+@@ -0,0 +1,64 @@
++// topdrive: Antigravity seat resume (mirrors codex-resume.ts). Relaunches `agy --conversation <id>` in the seat's
++// pane through the SAME command builder as a fresh launch (billing scrub stays), then waits for the TUI's ready
++// footer. A trust prompt is attention-required (operator action), never a silent failure.
++
++import { setTimeout as sleep } from "node:timers/promises";
++import type { TmuxAdapter } from "./tmux.js";
++import type { ResumeResult } from "./claude-resume.js";
++import { validateResumeToken } from "../domain/resume-token-validation.js";
++import { AGY_READY_MARKER, AGY_TRUST_MARKER, buildAgyLaunchCommand } from "./antigravity-runtime-adapter.js";
++
++export { type ResumeResult };
++
++interface AntigravityResumeOptions {
++  pollMs?: number;
++  maxWaitMs?: number;
++  sleep?: (ms: number) => Promise<void>;
++  /** `useG1Credits` from agy; true => refuse (paid overage). Failures count as unknown. */
++  readUseG1Credits?: () => Promise<boolean | "unknown">;
++}
++
++export class AntigravityResumeAdapter {
++  constructor(private tmux: TmuxAdapter, private options: AntigravityResumeOptions = {}) {}
++
++  canResume(resumeType: string | null, resumeToken: string | null): boolean {
++    return resumeType === "antigravity_id" && !!resumeToken;
++  }
++
++  async resume(
++    tmuxSessionName: string,
++    _resumeType: string | null,
++    resumeToken: string | null,
++    _cwd: string,
++    model?: string | null,
++    resolvedPosture?: "floor" | "full_bypass",
++    effort?: string | null,
++  ): Promise<ResumeResult> {
++    const v = validateResumeToken("antigravity", resumeToken);
++    if (!v.ok) return { ok: false, code: "invalid_resume_token", message: `antigravity resume: ${v.error}` };
++
++    let g1: boolean | "unknown" = "unknown";
++    try { g1 = (await this.options.readUseG1Credits?.()) ?? "unknown"; } catch { /* unknown */ }
++    if (g1 === true) {
++      return { ok: false, code: "attention_required", message: "agy has useG1Credits=true, so an exhausted plan would spend purchased credits (allow_paid_overage=false). Turn it off in agy (/config), then retry the restore." };
++    }
++
++    const cmd = buildAgyLaunchCommand({ resumeToken: v.token, model, effort, fullBypass: resolvedPosture === "full_bypass" });
++    const sent = await this.tmux.sendShellCommand(tmuxSessionName, cmd);
++    if (!sent.ok) return { ok: false, code: "launch_failed", message: `Failed to send resume command: ${sent.message}` };
++
++    const pollMs = this.options.pollMs ?? 500;
++    const maxWaitMs = this.options.maxWaitMs ?? 30_000;
++    const wait = this.options.sleep ?? ((ms: number) => sleep(ms));
++    let last = "";
++    for (let waited = 0; waited <= maxWaitMs; waited += pollMs) {
++      last = (await this.tmux.capturePaneContent(tmuxSessionName, 40)) ?? "";
++      if (last.includes(AGY_TRUST_MARKER)) {
++        return { ok: false, code: "attention_required", message: "agy is waiting on the folder trust prompt; trust this folder once, then retry the restore", evidence: last.split("\n").slice(-8).join("\n") };
++      }
++      if (last.includes(AGY_READY_MARKER)) return { ok: true };
++      await wait(pollMs);
++    }
++    return { ok: false, code: "resume_not_ready", message: "agy did not become ready after `--conversation` resume", evidence: last.split("\n").slice(-8).join("\n") } as ResumeResult;
++  }
++}
+diff --git a/packages/daemon/src/adapters/antigravity-runtime-adapter.ts b/packages/daemon/src/adapters/antigravity-runtime-adapter.ts
+new file mode 100644
+index 0000000..b2e771f
+--- /dev/null
++++ b/packages/daemon/src/adapters/antigravity-runtime-adapter.ts
+@@ -0,0 +1,215 @@
++// topdrive — the Antigravity (`agy`) runtime adapter (tmux TUI seat, Codex/Claude shape).
++//
++// Facts probed against agy 1.2.14 (see OPENRIG_EXTENSION_MAP.md):
++//  - agy draws on the alternate screen; pane_current_command misreports ("bash"), so screen markers are authoritative.
++//  - The ready screen shows the footer "? for shortcuts"; a first launch in a new folder shows a
++//    trust gate ("Do you trust the contents of this project?") — surfaced as attention-required.
++//  - The conversation DB (<conversationsDir>/<uuid>.db) is created only after the FIRST prompt, so a
++//    fresh launch has no resume token yet; captureConversationId() derives it later from a
++//    before/after directory diff and refuses to guess when ambiguous.
++//  - Resume = `agy --conversation <uuid>`. Fork is not supported.
++//  - Billing guard (subscription_only): the launch command unsets API-credential env so the seat can
++//    only use the interactive account login. Bypass flag only for an explicit full_bypass posture.
++
++import nodePath from "node:path";
++import os from "node:os";
++import type { TmuxAdapter } from "./tmux.js";
++import type {
++  RuntimeAdapter, NodeBinding, ResolvedStartupFile, InstalledResource, ProjectionResult,
++  StartupDeliveryResult, ReadinessResult, HarnessLaunchResult, ForkSource,
++} from "../domain/runtime-adapter.js";
++import { resolveConcreteHint } from "../domain/runtime-adapter.js";
++import type { ProjectionPlan } from "../domain/projection-planner.js";
++import { validateResumeToken } from "../domain/resume-token-validation.js";
++import { mergeManagedBlock } from "../domain/managed-blocks.js";
++import { shellQuote } from "./shell-quote.js";
++import { readAgyConversationId, type AgyConversationProbe, type AgyConversationRead } from "./antigravity-conversation.js";
++
++export const AGY_CONVERSATIONS_DIR_DEFAULT = nodePath.join(os.homedir(), ".gemini", "antigravity-cli", "conversations");
++/** API-credential env that would switch agy off the subscription login. */
++export const AGY_STRIPPED_ENV = ["GEMINI_API_KEY", "GOOGLE_API_KEY"] as const;
++
++const SHELL_COMMANDS = new Set(["bash", "fish", "nu", "sh", "tmux", "zsh"]);
++export const AGY_READY_MARKER = "? for shortcuts";
++export const AGY_TRUST_MARKER = "Do you trust the contents of this project?";
++const READY_MARKER = AGY_READY_MARKER;
++const TRUST_MARKER = AGY_TRUST_MARKER;
++const CONVERSATION_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.db$/;
++
++/** The one place the agy launch command is assembled (billing scrub, resume, model, effort, posture). */
++export function buildAgyLaunchCommand(o: { resumeToken?: string; model?: string | null; effort?: string | null; fullBypass?: boolean }): string {
++  return [
++    `env ${AGY_STRIPPED_ENV.map((n) => `-u ${n}`).join(" ")} agy`,
++    o.resumeToken ? `--conversation ${shellQuote(o.resumeToken)}` : "",
++    o.model?.trim() ? `--model ${shellQuote(o.model.trim())}` : "",
++    o.effort?.trim() ? `--effort ${shellQuote(o.effort.trim())}` : "",
++    o.fullBypass ? "--dangerously-skip-permissions" : "",
++  ].filter(Boolean).join(" ");
++}
++
++export interface AntigravityFsOps {
++  readFile(path: string): string;
++  writeFile(path: string, content: string): void;
++  exists(path: string): boolean;
++  mkdirp(path: string): void;
++  listFiles?(dirPath: string): string[];
++}
++
++export interface AntigravityAdapterDeps {
++  tmux: TmuxAdapter;
++  fsOps: AntigravityFsOps;
++  conversationsDir?: string;
++  /** Builds the OS probe (ps/lsof) for one seat; absent => conversation capture is a no-op. */
++  conversationProbe?: (sessionName: string) => AgyConversationProbe;
++  /** `useG1Credits` from `agy /config`. true => purchased credits could be spent past plan quota => launch refused. */
++  readUseG1Credits?: () => Promise<boolean | "unknown">;
++  sleep?: (ms: number) => Promise<void>;
++}
++
++export class AntigravityRuntimeAdapter implements RuntimeAdapter {
++  readonly runtime = "antigravity";
++  private tmux: TmuxAdapter;
++  private fs: AntigravityFsOps;
++  private conversationsDir: string;
++  private sleep: (ms: number) => Promise<void>;
++  private conversationProbe: AntigravityAdapterDeps["conversationProbe"];
++  private readUseG1Credits: AntigravityAdapterDeps["readUseG1Credits"];
++
++  constructor(deps: AntigravityAdapterDeps) {
++    this.readUseG1Credits = deps.readUseG1Credits;
++    this.conversationProbe = deps.conversationProbe;
++    this.tmux = deps.tmux;
++    this.fs = deps.fsOps;
++    this.conversationsDir = deps.conversationsDir ?? AGY_CONVERSATIONS_DIR_DEFAULT;
++    this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
++  }
++
++  /** The seat's live conversation id (resume-token source). Structural shape shared with the other runtimes' readers. */
++  async read(sessionName: string): Promise<AgyConversationRead> {
++    if (!this.conversationProbe) return { ok: false, reason: "probe_failed" };
++    return readAgyConversationId(this.conversationProbe(sessionName));
++  }
++
++  /** Conversation ids currently on disk — snapshot before launch to diff after the first prompt. */
++  snapshotConversationFiles(): Set<string> {
++    return new Set(this.fs.listFiles?.(this.conversationsDir) ?? []);
++  }
++
++  /** The single conversation uuid that appeared since `before`; null when none or ambiguous. */
++  captureConversationId(before: Set<string>): string | null {
++    const fresh = (this.fs.listFiles?.(this.conversationsDir) ?? [])
++      .filter((f) => !before.has(f))
++      .map((f) => CONVERSATION_RE.exec(f)?.[1])
++      .filter((id): id is string => !!id);
++    return fresh.length === 1 ? fresh[0]! : null;
++  }
++
++  async listInstalled(_binding: NodeBinding): Promise<InstalledResource[]> {
++    return [];
++  }
++
++  // v1: guidance only (AGENTS.md managed block). Skills are skipped, not failed.
++  async project(plan: ProjectionPlan, binding: NodeBinding): Promise<ProjectionResult> {
++    const projected: string[] = [];
++    const skipped: string[] = [];
++    const failed: Array<{ effectiveId: string; error: string }> = [];
++    for (const entry of plan.entries) {
++      if (entry.classification === "no_op" || entry.category !== "guidance") {
++        skipped.push(entry.effectiveId);
++        continue;
++      }
++      try {
++        if (this.mergeGuidance(nodePath.join(binding.cwd, "AGENTS.md"), entry.effectiveId, this.fs.readFile(entry.absolutePath))) {
++          projected.push(entry.effectiveId);
++        } else {
++          skipped.push(entry.effectiveId);
++        }
++      } catch (err) {
++        failed.push({ effectiveId: entry.effectiveId, error: (err as Error).message });
++      }
++    }
++    return { projected, skipped, failed };
++  }
++
++  async deliverStartup(files: ResolvedStartupFile[], binding: NodeBinding): Promise<StartupDeliveryResult> {
++    let delivered = 0;
++    const failed: Array<{ path: string; error: string }> = [];
++    for (const file of files) {
++      try {
++        const content = this.fs.readFile(file.absolutePath);
++        const hint = file.deliveryHint === "auto" ? resolveConcreteHint(file.path, content) : file.deliveryHint;
++        if (hint === "guidance_merge") {
++          if (!this.mergeGuidance(nodePath.join(binding.cwd, "AGENTS.md"), file.path, content)) continue;
++        } else if (hint === "send_text" && binding.tmuxSession) {
++          const t = await this.tmux.sendText(binding.tmuxSession, content);
++          if (!t.ok) throw new Error(t.message);
++          await this.sleep(200);
++          const s = await this.tmux.sendKeys(binding.tmuxSession, ["C-m"]);
++          if (!s.ok) throw new Error(s.message);
++        } else {
++          continue; // skill_install: unsupported in v1, not counted as delivered
++        }
++        delivered++;
++      } catch (err) {
++        if (file.required) failed.push({ path: file.path, error: (err as Error).message });
++      }
++    }
++    return { delivered, failed };
++  }
++
++  async launchHarness(
++    binding: NodeBinding,
++    opts: { name: string; resumeToken?: string; forkSource?: ForkSource },
++  ): Promise<HarnessLaunchResult> {
++    if (!binding.tmuxSession) return { ok: false, error: "No tmux session bound — cannot launch the Antigravity harness" };
++    if (opts.resumeToken && opts.forkSource) return { ok: false, error: "resumeToken and forkSource are mutually exclusive — pick one" };
++    if (opts.forkSource) return { ok: false, error: "antigravity fork is not supported in v1" };
++
++    // Paid-overage guard: a probe failure never blocks (doctor warns); only an explicit `true` does.
++    let g1: boolean | "unknown" = "unknown";
++    try { g1 = (await this.readUseG1Credits?.()) ?? "unknown"; } catch { /* unknown */ }
++    if (g1 === true) {
++      return { ok: false, error: "agy has useG1Credits=true, so an exhausted plan would spend purchased credits (allow_paid_overage=false). Turn it off in agy (/config) and relaunch.", recovery: "attention_required" };
++    }
++
++    let resumeToken: string | undefined;
++    if (opts.resumeToken) {
++      const v = validateResumeToken("antigravity", opts.resumeToken);
++      if (!v.ok) return { ok: false, error: `antigravity resume: ${v.error}` };
++      resumeToken = v.token;
++    }
++
++    const cmd = buildAgyLaunchCommand({ ...(resumeToken ? { resumeToken } : {}), model: binding.model, effort: binding.effort, fullBypass: binding.launchPosture === "full_bypass" });
++
++    const sent = await this.tmux.sendShellCommand(binding.tmuxSession, cmd);
++    if (!sent.ok) return { ok: false, error: `Failed to send launch command: ${sent.message}` };
++
++    // A fresh seat has no conversation id until its first prompt (see header); never fabricate one.
++    return resumeToken ? { ok: true, resumeToken, resumeType: "antigravity_id" } : { ok: true };
++  }
++
++  async checkReady(binding: NodeBinding): Promise<ReadinessResult> {
++    if (!binding.tmuxSession) return { ready: false, reason: "No tmux session bound" };
++    if (!(await this.tmux.hasSession(binding.tmuxSession))) return { ready: false, reason: "tmux session not responsive" };
++    // agy draws on the terminal's alternate screen, so a marker on the CURRENT screen proves the TUI is up; stale
++    // scrollback cannot satisfy it. pane_current_command is NOT trustworthy here (probed: "bash" while agy runs).
++    const pane = (await this.tmux.capturePaneContent(binding.tmuxSession, 40)) ?? "";
++    if (pane.includes(TRUST_MARKER)) {
++      return { ready: false, reason: "agy is waiting on the folder trust prompt; run `agy` once in this folder and trust it (stored in ~/.gemini/antigravity-cli/settings.json)", code: "trust_gate" };
++    }
++    if (pane.includes(READY_MARKER)) return { ready: true };
++    const paneCommand = (await this.tmux.getPaneCommand(binding.tmuxSession)) ?? "";
++    if (SHELL_COMMANDS.has(paneCommand)) {
++      return { ready: false, reason: "agy is not running; the pane is back at a shell", code: "runner_exited" };
++    }
++    return { ready: false, reason: "agy has not reported ready yet", code: "awaiting_runtime" };
++  }
++
++  // Per-seat `rig-role` content collides across pod-mates in a shared cwd file; it is delivered via
++  // send_text instead (same rule as the Pi/Codex adapters, ADR-0006).
++  private mergeGuidance(targetPath: string, blockId: string, content: string): boolean {
++    if (blockId === "rig-role") return false;
++    mergeManagedBlock(this.fs, targetPath, blockId, content);
++    return true;
++  }
++}
+diff --git a/packages/daemon/src/adapters/tmux.ts b/packages/daemon/src/adapters/tmux.ts
+index 955df49..ba6d83c 100644
+--- a/packages/daemon/src/adapters/tmux.ts
++++ b/packages/daemon/src/adapters/tmux.ts
+@@ -413,6 +413,13 @@ export class TmuxAdapter {
+     private argvExec?: ArgvExecFn,
+   ) {}
+ 
++  private envScrub: string[] = [];
++  /** Env var names unset in every newly created pane shell (billing guard). Names are validated: they reach a shell. */
++  setEnvScrub(names: readonly string[]): void {
++    for (const n of names) if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(n)) throw new Error(`invalid env name for scrub: ${JSON.stringify(n)}`);
++    this.envScrub = [...names];
++  }
++
+   /**
+    * Run a multiplexer command. `argv` is what is EXECUTED on both paths:
+    * elements are verbatim (no quoting layer) when argvExec is wired;
+@@ -534,6 +541,28 @@ export class TmuxAdapter {
+       return { ok: false, code: "guard_lease_required", message: "Managed launch requires a lifecycle lease before terminal creation." };
+     }
+     const result = await this.createSessionUnchecked(name, cwd, env);
++    if (result.ok && this.envScrub.length > 0) {
++      // topdrive billing guard (subscription_only): API-credential env must not reach any harness in this pane.
++      // Fail closed: an unknown shell dialect or an undeliverable scrub removes the session rather than leaving it credentialed.
++      const scrubFail = async (err: unknown): Promise<TmuxResult> => {
++        try { await this.run(["tmux", "kill-session", "-t", name], `tmux kill-session -t ${shellQuote(name)}`); } catch { /* best effort */ }
++        return classifyWriteError(err);
++      };
++      try {
++        const shellOut = await this.run(["tmux", "display-message", "-p", "-t", name, "#{pane_current_command}"],
++          `tmux display-message -p -t ${shellQuote(name)} "#{pane_current_command}"`);
++        const shell = shellOut.trim().replace(/^-/, "").split("/").pop() ?? "";
++        const names = this.envScrub.join(" ");
++        const command = ["bash", "zsh", "sh", "dash", "ksh"].includes(shell) ? `unset ${names}`
++          : shell === "fish" ? `set -e ${names}`
++          : shell === "nu" ? `hide-env --ignore-errors ${names}`
++          : null;
++        if (command === null) return await scrubFail(new Error(`billing guard: cannot scrub API credentials from pane shell "${shell || "unknown"}" (supported: bash, zsh, sh, dash, ksh, fish, nu)`));
++        await this.run(["tmux", "send-keys", "-t", name, command, "C-m"], `tmux send-keys -t ${shellQuote(name)} ${shellQuote(command)} C-m`);
++      } catch (err) {
++        return await scrubFail(err);
++      }
++    }
+     if (result.ok && this.deliveryGuard && env?.OPENRIG_NODE_ID) {
+       try {
+         const panes = await this.listPanes(name);
+diff --git a/packages/daemon/src/domain/api-credential-env.ts b/packages/daemon/src/domain/api-credential-env.ts
+new file mode 100644
+index 0000000..3b6109e
+--- /dev/null
++++ b/packages/daemon/src/domain/api-credential-env.ts
+@@ -0,0 +1,8 @@
++// Subscription-only seats: env vars that switch an agent harness from its interactive subscription login to API
++// billing. Managed pane shells unset these (TmuxAdapter.setEnvScrub). CLAUDE_CODE_OAUTH_TOKEN is a subscription
++// token, deliberately absent.
++export const API_CREDENTIAL_ENV = {
++  anthropic: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
++  openai: ["OPENAI_API_KEY", "CODEX_API_KEY"],
++  google: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
++} as const;
+diff --git a/packages/daemon/src/domain/claim-service.ts b/packages/daemon/src/domain/claim-service.ts
+index 006c929..fe8d727 100644
+--- a/packages/daemon/src/domain/claim-service.ts
++++ b/packages/daemon/src/domain/claim-service.ts
+@@ -84,6 +84,7 @@ interface ClaimServiceDeps {
+     readSessionFile(sessionName: string): { ok: true; sessionFile: string } | { ok: false; reason: string };
+   };
+   ompRunnerStateStore?: ResumeTokenCaptureDeps["ompRunnerStateStore"];
++  antigravityConversationReader?: ResumeTokenCaptureDeps["antigravityConversationReader"];
+ }
+ 
+ interface BindOptions {
+@@ -119,6 +120,7 @@ export class ClaimService {
+   private resumeTokenCapturer: ClaimServiceDeps["resumeTokenCapturer"] | null;
+   private piRunnerStateStore: ClaimServiceDeps["piRunnerStateStore"] | null;
+   private ompRunnerStateStore: ClaimServiceDeps["ompRunnerStateStore"] | null;
++  private antigravityConversationReader: ClaimServiceDeps["antigravityConversationReader"] | null;
+ 
+   constructor(deps: ClaimServiceDeps) {
+     if (deps.db !== deps.rigRepo.db) throw new Error("ClaimService: rigRepo must share the same db handle");
+@@ -138,6 +140,7 @@ export class ClaimService {
+     this.resumeTokenCapturer = deps.resumeTokenCapturer ?? null;
+     this.piRunnerStateStore = deps.piRunnerStateStore ?? null;
+     this.ompRunnerStateStore = deps.ompRunnerStateStore ?? null;
++    this.antigravityConversationReader = deps.antigravityConversationReader ?? null;
+   }
+ 
+   private async observeBindingPane(
+@@ -243,7 +246,7 @@ export class ClaimService {
+       // FR-3's adoption provenance/audit semantics are unchanged.
+       const derived = await deriveResumeToken(
+         { runtime: input.runtime, sessionName: input.sessionName },
+-        { contextUsageStore: this.contextUsageStore, claudeProcessStartedAt: this.claudeProcessStartedAt, resumeTokenCapturer: this.resumeTokenCapturer, piRunnerStateStore: this.piRunnerStateStore, ompRunnerStateStore: this.ompRunnerStateStore },
++        { contextUsageStore: this.contextUsageStore, claudeProcessStartedAt: this.claudeProcessStartedAt, resumeTokenCapturer: this.resumeTokenCapturer, piRunnerStateStore: this.piRunnerStateStore, ompRunnerStateStore: this.ompRunnerStateStore, antigravityConversationReader: this.antigravityConversationReader },
+       );
+       if (derived.outcome === "exempt" || derived.outcome === "noop") return;
+       const runtime = input.runtime as string; // non-null past exempt
+diff --git a/packages/daemon/src/domain/discovery-types.ts b/packages/daemon/src/domain/discovery-types.ts
+index 9a7da58..88e08ee 100644
+--- a/packages/daemon/src/domain/discovery-types.ts
++++ b/packages/daemon/src/domain/discovery-types.ts
+@@ -1,5 +1,5 @@
+ /** Runtime hint from fingerprinting */
+-export type RuntimeHint = "claude-code" | "codex" | "pi" | "omp" | "terminal" | "unknown";
++export type RuntimeHint = "claude-code" | "codex" | "pi" | "omp" | "antigravity" | "terminal" | "unknown";
+ 
+ /** Confidence level of the runtime detection */
+ export type Confidence = "highest" | "high" | "medium" | "low";
+diff --git a/packages/daemon/src/domain/restore-orchestrator.ts b/packages/daemon/src/domain/restore-orchestrator.ts
+index 3cd2cae..f86a90d 100644
+--- a/packages/daemon/src/domain/restore-orchestrator.ts
++++ b/packages/daemon/src/domain/restore-orchestrator.ts
+@@ -144,6 +144,7 @@ interface RestoreOrchestratorDeps {
+    *  resume without the adapter falls through to the honest no-adapter error. */
+   piResume?: PiResumeAdapter;
+   ompResume?: OmpResumeAdapter;
++  antigravityResume?: import("../adapters/antigravity-resume.js").AntigravityResumeAdapter;
+   transcriptStore?: TranscriptStore;
+   serviceOrchestrator?: import("./service-orchestrator.js").ServiceOrchestrator;
+   listProcesses?: () => Promise<Array<{ pid: number; ppid: number; command: string }>>;
+@@ -163,6 +164,7 @@ export class RestoreOrchestrator {
+   private codexResume: CodexResumeAdapter;
+   private piResume: PiResumeAdapter | null;
+   private ompResume: OmpResumeAdapter | null;
++  private antigravityResume: import("../adapters/antigravity-resume.js").AntigravityResumeAdapter | null;
+   private transcriptStore: TranscriptStore | null;
+   private serviceOrchestrator: import("./service-orchestrator.js").ServiceOrchestrator | null;
+   private listProcesses: (() => Promise<Array<{ pid: number; ppid: number; command: string }>>) | undefined;
+@@ -203,6 +205,7 @@ export class RestoreOrchestrator {
+     this.codexResume = deps.codexResume;
+     this.piResume = deps.piResume ?? null;
+     this.ompResume = deps.ompResume ?? null;
++    this.antigravityResume = deps.antigravityResume ?? null;
+     this.transcriptStore = deps.transcriptStore ?? null;
+     this.serviceOrchestrator = deps.serviceOrchestrator ?? null;
+     this.listProcesses = deps.listProcesses;
+@@ -1643,7 +1646,8 @@ export class RestoreOrchestrator {
+     try {
+       const selection = new NativePermissionStore(this.db).read(nodeId);
+       const runtime = this.claudeResume.canResume(resumeType, resumeToken) ? "claude-code"
+-        : this.codexResume.canResume(resumeType, resumeToken) ? "codex" : "pi";
++        : this.codexResume.canResume(resumeType, resumeToken) ? "codex"
++        : this.antigravityResume?.canResume(resumeType, resumeToken) ? "antigravity" : "pi";
+       if (selection && selection.runtime !== runtime) throw new Error("Seat runtime changed since permission selection; explicitly select again or inherit.");
+       const override = permissionBindingOverride(selection);
+       resolvedPosture = override.launchPosture ?? resolvedPosture;
+@@ -1721,6 +1725,13 @@ export class RestoreOrchestrator {
+     }
+ 
+ 
++    if (this.antigravityResume?.canResume(resumeType, resumeToken)) {
++      const result = await this.antigravityResume.resume(sessionName, resumeType, resumeToken, cwd, model, resolvedPosture, effort);
++      if (result.ok) return { kind: "resumed" };
++      if (result.code === "attention_required") return { kind: "attention_required", message: result.message, evidence: (result as { evidence?: string }).evidence };
++      return { kind: "failed", message: result.message };
++    }
++
+     return { kind: "failed", message: "No resume adapter available for this runtime/token combination." };
+   }
+ 
+diff --git a/packages/daemon/src/domain/resume-metadata-refresher.ts b/packages/daemon/src/domain/resume-metadata-refresher.ts
+index 52d3a11..ee1e2a0 100644
+--- a/packages/daemon/src/domain/resume-metadata-refresher.ts
++++ b/packages/daemon/src/domain/resume-metadata-refresher.ts
+@@ -47,6 +47,8 @@ interface ResumeMetadataRefresherDeps {
+   };
+   /** #421 — start time of the pane's current Claude process; a sidecar sampled earlier is not used. */
+   claudeProcessStartedAt?: ResumeTokenCaptureDeps["claudeProcessStartedAt"];
++  /** topdrive: live agy conversation id of a seat (resume-token source for runtime "antigravity"). */
++  antigravityConversationReader?: ResumeTokenCaptureDeps["antigravityConversationReader"];
+ }
+ 
+ export class ResumeMetadataRefresher {
+@@ -60,6 +62,7 @@ export class ResumeMetadataRefresher {
+   private homeDir: string;
+   private contextUsageStore: ResumeMetadataRefresherDeps["contextUsageStore"] | null;
+   private claudeProcessStartedAt: ResumeMetadataRefresherDeps["claudeProcessStartedAt"] | null;
++  private antigravityConversationReader: ResumeMetadataRefresherDeps["antigravityConversationReader"] | null;
+ 
+   constructor(deps: ResumeMetadataRefresherDeps) {
+     this.sessionRegistry = deps.sessionRegistry;
+@@ -83,6 +86,7 @@ export class ResumeMetadataRefresher {
+     this.homeDir = deps.homeDir ?? os.homedir();
+     this.contextUsageStore = deps.contextUsageStore ?? null;
+     this.claudeProcessStartedAt = deps.claudeProcessStartedAt ?? null;
++    this.antigravityConversationReader = deps.antigravityConversationReader ?? null;
+   }
+ 
+   /**
+@@ -151,6 +155,15 @@ export class ResumeMetadataRefresher {
+         continue;
+       }
+ 
++      if (session.runtime === "antigravity") {
++        // topdrive: fill-null from the seat's live agy conversation; never clobber a present token.
++        const live = await this.antigravityConversationReader?.read(session.sessionName);
++        if (!live?.ok) continue;
++        if (!session.resumeToken) this.sessionRegistry.updateResumeToken(session.sessionId, "antigravity_id", live.conversationId, "scrape");
++        else if (fillNullOnly && live.conversationId === session.resumeToken) this.sessionRegistry.markResumeProbeResult(session.sessionId, "resumable");
++        continue;
++      }
++
+       if (session.runtime === "claude-code") {
+         if (!session.resumeToken) {
+           // OPR.0.4.3.20 FR-4 — null-fill from the Claude status-line sidecar
+diff --git a/packages/daemon/src/domain/resume-token-capture.ts b/packages/daemon/src/domain/resume-token-capture.ts
+index e360c2d..5eb12c9 100644
+--- a/packages/daemon/src/domain/resume-token-capture.ts
++++ b/packages/daemon/src/domain/resume-token-capture.ts
+@@ -33,6 +33,10 @@ export interface ResumeTokenCaptureDeps {
+   piRunnerStateStore?: {
+     readSessionFile(sessionName: string): { ok: true; sessionFile: string } | { ok: false; reason: string };
+   } | null;
++  /** topdrive: the live conversation id of the seat's `agy` process (read-only OS probe). */
++  antigravityConversationReader?: {
++    read(sessionName: string): Promise<{ ok: true; conversationId: string } | { ok: false; reason: string }>;
++  } | null;
+   /** Reads the separately rooted OMP runner sidecar; never reads Pi seat state. */
+   ompRunnerStateStore?: {
+     readSessionFile(sessionName: string): { ok: true; sessionFile: string } | { ok: false; reason: string };
+@@ -76,6 +80,7 @@ export async function isClaudeSidecarFromEarlierProcess(
+  *   codex       → the thread id derived from live pid-keyed logs
+  *   pi          → the pi-runner state sidecar's sessionFile (a file read)
+  *   omp         → the OMP runner state sidecar's sessionFile (separate root)
++ *   antigravity → the conversation DB the seat's live agy process holds open
+  * Returns a structured outcome; never throws for a missing/invalid token
+  * (those are honest skips). ANY unexpected throw from a dependency is the
+  * caller's to swallow (capture must never fail or block its lifecycle op).
+@@ -115,6 +120,11 @@ export async function deriveResumeToken(
+     }
+     if (state.sessionFile.trim().length > 0) token = state.sessionFile.trim();
+     else return { outcome: "skipped", reason: "missing_sidecar" };
++  } else if (runtime === "antigravity") {
++    if (!deps.antigravityConversationReader) return { outcome: "noop" }; // dep absent — silent no-op
++    const r = await deps.antigravityConversationReader.read(input.sessionName);
++    if (!r.ok) return { outcome: "skipped", reason: "probe_timeout" }; // not yet created / ambiguous: honest skip, no token
++    token = r.conversationId;
+   } else {
+     return { outcome: "noop" }; // resumeType set but runtime is not one we derive — defensive
+   }
+diff --git a/packages/daemon/src/domain/resume-token-validation.ts b/packages/daemon/src/domain/resume-token-validation.ts
+index c2ece58..20976d5 100644
+--- a/packages/daemon/src/domain/resume-token-validation.ts
++++ b/packages/daemon/src/domain/resume-token-validation.ts
+@@ -9,7 +9,7 @@
+ // actually resume" probe is intentionally out of scope (heavy + must not
+ // mutate live state); format validation is the safe, side-effect-free floor.
+ 
+-export type ResumeType = "claude_id" | "codex_id" | "pi_session_file" | "omp_session_file";
++export type ResumeType = "claude_id" | "codex_id" | "pi_session_file" | "omp_session_file" | "antigravity_id";
+ 
+ export interface ResumeTokenValidationOk {
+   ok: true;
+@@ -48,6 +48,7 @@ export function resumeTypeForRuntime(runtime: string | null): ResumeType | null
+   if (runtime === "codex") return "codex_id";
+   if (runtime === "pi") return "pi_session_file";
+   if (runtime === "omp") return "omp_session_file";
++  if (runtime === "antigravity") return "antigravity_id";
+   return null;
+ }
+ 
+@@ -95,7 +96,7 @@ export function validateResumeToken(
+   if (!resumeType) {
+     return {
+       ok: false,
+-      error: `set-resume-token is not supported for runtime "${runtime ?? "unknown"}" (only claude-code, codex, pi, and omp have resume tokens).`,
++      error: `set-resume-token is not supported for runtime "${runtime ?? "unknown"}" (only claude-code, codex, pi, omp, and antigravity have resume tokens).`,
+     };
+   }
+   if (typeof rawToken !== "string") {
+diff --git a/packages/daemon/src/domain/rigspec-preflight.ts b/packages/daemon/src/domain/rigspec-preflight.ts
+index 3866c68..2deaf9c 100644
+--- a/packages/daemon/src/domain/rigspec-preflight.ts
++++ b/packages/daemon/src/domain/rigspec-preflight.ts
+@@ -12,6 +12,7 @@ const RUNTIME_COMMANDS: Record<string, string> = {
+   "codex": "codex --version",
+   "pi": "pi --version",
+   "omp": "omp --version",
++  "antigravity": "agy --version",
+ };
+ 
+ interface RigSpecPreflightDeps {
+@@ -143,7 +144,7 @@ import {
+ 
+ // Slice 51-01 (OPR.0.5.1.1): `stub` is a first-class runtime (the deterministic node-script fake harness
+ // through the real orchestrator) — admitted at the modern-pod preflight gate alongside the real runtimes.
+-const SUPPORTED_RUNTIMES = new Set(["claude-code", "codex", "pi", "omp", "terminal", "stub"]);
++const SUPPORTED_RUNTIMES = new Set(["claude-code", "codex", "pi", "omp", "antigravity", "terminal", "stub"]);
+ 
+ // Default daemon-shipped asset paths for the managed Claude activity hooks — the SAME files the
+ // ClaudeCodeAdapter is wired with in startup.ts (validation is the shared module either way).
+diff --git a/packages/daemon/src/domain/rigspec-schema.ts b/packages/daemon/src/domain/rigspec-schema.ts
+index be4ba00..51e067b 100644
+--- a/packages/daemon/src/domain/rigspec-schema.ts
++++ b/packages/daemon/src/domain/rigspec-schema.ts
+@@ -1183,7 +1183,7 @@ function normalizePod(raw: Record<string, unknown>): RigSpecPod {
+ // -- Legacy flat-node RigSpec validation (pre-reboot) --
+ // TODO: Remove when AS-T08b/AS-T12 migrate all consumers
+ 
+-const LEGACY_KNOWN_RUNTIMES = new Set(["claude-code", "codex", "pi", "omp"]);
++const LEGACY_KNOWN_RUNTIMES = new Set(["claude-code", "codex", "pi", "omp", "antigravity"]);
+ const LEGACY_KNOWN_RESTORE_POLICIES = new Set(["resume_if_possible", "relaunch_fresh", "checkpoint_only"]);
+ const LEGACY_KNOWN_EDGE_KINDS = new Set(["delegates_to", "spawned_by", "can_observe"]);
+ 
+diff --git a/packages/daemon/src/domain/seat-handover-service.ts b/packages/daemon/src/domain/seat-handover-service.ts
+index 356f3f7..59180e0 100644
+--- a/packages/daemon/src/domain/seat-handover-service.ts
++++ b/packages/daemon/src/domain/seat-handover-service.ts
+@@ -147,6 +147,7 @@ interface SeatHandoverServiceDeps {
+   piRunnerStateStore?: ResumeTokenCaptureDeps["piRunnerStateStore"];
+   /** OMP runner sidecar reader for independently isolated OMP seats. */
+   ompRunnerStateStore?: ResumeTokenCaptureDeps["ompRunnerStateStore"];
++  antigravityConversationReader?: ResumeTokenCaptureDeps["antigravityConversationReader"];
+   /** Readiness timeout for the successor launch (tests shorten it). */
+   readinessTimeoutMs?: number;
+   /** Injectable sleep for the successor readiness backoff (tests). */
+@@ -260,6 +261,7 @@ export class SeatHandoverService {
+       resumeTokenCapturer: deps.resumeTokenCapturer ?? null,
+       piRunnerStateStore: deps.piRunnerStateStore ?? null,
+       ompRunnerStateStore: deps.ompRunnerStateStore ?? null,
++      antigravityConversationReader: deps.antigravityConversationReader ?? null,
+     };
+   }
+ 
+diff --git a/packages/daemon/src/domain/workflow-types.ts b/packages/daemon/src/domain/workflow-types.ts
+index 1233746..83301a9 100644
+--- a/packages/daemon/src/domain/workflow-types.ts
++++ b/packages/daemon/src/domain/workflow-types.ts
+@@ -18,7 +18,7 @@ export const WORKFLOW_EXIT_KINDS = ["handoff", "waiting", "done", "failed"] as c
+ /** OPR.0.4.6.WF2 FR-2: the pinnable harness value space — AGENT harnesses
+  *  only. `terminal` is deliberately excluded (a terminal node is not an
+  *  agent harness); Pi Agent joins in 0.4.7 as a value-space extension. */
+-export const WORKFLOW_AGENT_HARNESSES = ["claude-code", "codex"] as const;
++export const WORKFLOW_AGENT_HARNESSES = ["claude-code", "codex", "antigravity"] as const;
+ export type WorkflowAgentHarness = (typeof WORKFLOW_AGENT_HARNESSES)[number];
+ 
+ /** OPR.0.4.6.WF2 FR-5: the structured step-level gate declaration (singular
+diff --git a/packages/daemon/src/routes/seat.ts b/packages/daemon/src/routes/seat.ts
+index b526693..935914d 100644
+--- a/packages/daemon/src/routes/seat.ts
++++ b/packages/daemon/src/routes/seat.ts
+@@ -165,6 +165,11 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
+         ? { readSessionFile: pi.readSessionFile.bind(pi) as (sessionName: string) => { ok: true; sessionFile: string } | { ok: false; reason: string } }
+         : undefined;
+     })(),
++    antigravityConversationReader: (() => {
++      const adapters = c.get("runtimeAdapters" as never) as Record<string, unknown> | undefined;
++      const agy = adapters?.["antigravity"] as { read?: (s: string) => Promise<{ ok: true; conversationId: string } | { ok: false; reason: string }> } | undefined;
++      return typeof agy?.read === "function" ? { read: agy.read.bind(agy) } : undefined;
++    })(),
+     ompRunnerStateStore: (() => {
+       const adapters = c.get("runtimeAdapters" as never) as Record<string, unknown> | undefined;
+       const omp = adapters?.["omp"] as { readSessionFile?: (sessionName: string) => { ok: true; sessionFile: string } | { ok: false; reason: string } } | undefined;
+diff --git a/packages/daemon/src/startup.ts b/packages/daemon/src/startup.ts
+index 4fdee3a..9e31410 100644
+--- a/packages/daemon/src/startup.ts
++++ b/packages/daemon/src/startup.ts
+@@ -465,6 +465,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult>
+   const argvExec = opts?.argvExec
+     ?? (opts?.tmuxExec ? undefined : process.platform === "win32" ? execArgvCommand : undefined);
+   const tmuxAdapter = new TmuxAdapter(opts?.tmuxExec ?? execCommand, undefined, argvExec);
++  // Subscription-only seats (default): strip API credentials from every managed pane shell, failing closed.
++  if (process.env["TOPDRIVE_BILLING_MODE"] !== "unrestricted") {
++    const { API_CREDENTIAL_ENV } = await import("./domain/api-credential-env.js");
++    tmuxAdapter.setEnvScrub([...new Set(Object.values(API_CREDENTIAL_ENV).flat())]);
++  }
+   const deliveryGuard = new SeatDeliveryGuard(db, target => resolveGuardTarget(db, target));
+   deliveryGuard.recoverActivation();
+   tmuxAdapter.deliveryGuard = deliveryGuard;
+@@ -619,9 +624,23 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult>
+   const composeAdapter = new ComposeServicesAdapter(opts?.tmuxExec ?? execCommand);
+   const serviceOrchestrator = new ServiceOrchestrator({ rigRepo, composeAdapter });
+ 
++  const { execFile: execFileCb } = await import("node:child_process");
++  // spec §9: refuse to launch while agy would spend purchased credits. Cached 60s; any probe failure => "unknown" (not blocking).
++  const readAgyUseG1Credits = (() => {
++    let cached: { at: number; v: boolean | "unknown" } | null = null;
++    return () => new Promise<boolean | "unknown">((resolve) => {
++      if (cached && Date.now() - cached.at < 60_000) return resolve(cached.v);
++      execFileCb("agy", ["-p", "/config", "--output-format", "json"], { timeout: 15_000, maxBuffer: 1024 * 1024, env: { ...process.env, GEMINI_API_KEY: undefined, GOOGLE_API_KEY: undefined } }, (err, out) => {
++        let v: boolean | "unknown" = "unknown";
++        if (!err) { try { const g = JSON.parse(out)?.command?.data?.config?.useG1Credits; if (typeof g === "boolean") v = g; } catch { /* unknown */ } }
++        cached = { at: Date.now(), v }; resolve(v);
++      });
++    });
++  })();
+   const restoreOrchestrator = new RestoreOrchestrator({
+     db, rigRepo, sessionRegistry, eventBus, snapshotRepo, snapshotCapture,
+     checkpointStore, nodeLauncher, tmuxAdapter, claudeResume, codexResume, piResume, ompResume,
++    antigravityResume: new (await import("./adapters/antigravity-resume.js")).AntigravityResumeAdapter(tmuxAdapter, { readUseG1Credits: readAgyUseG1Credits }),
+     transcriptStore, serviceOrchestrator,
+   });
+ 
+@@ -755,6 +774,20 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult>
+   // OPR.0.4.6.PI1 — the RPC-first Pi adapter (runner-in-a-pane). Same fsOps
+   // shape as the Codex adapter; seat isolation roots under piStateRoot.
+   const piAdapter = new PiRuntimeAdapter({ tmux: tmuxAdapter, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; } }, stateRoot: piStateRoot, runnerEntryPath: piRunnerEntryPath });
++  // Antigravity (agy) tmux-TUI adapter; its launch command strips API keys and refuses useG1Credits=true.
++  const { AntigravityRuntimeAdapter } = await import("./adapters/antigravity-runtime-adapter.js");
++  const antigravityAdapter = new AntigravityRuntimeAdapter({ tmux: tmuxAdapter, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (d: string) => { try { return fs.readdirSync(d); } catch { return []; } } },
++    // read-only ps/lsof probe of the seat's live agy process (exact conversation id; see antigravity-conversation.ts)
++    readUseG1Credits: readAgyUseG1Credits,
++    conversationProbe: (sessionName: string) => {
++      const run = (cmd: string, args: string[]) => new Promise<string>((resolve, reject) => execFileCb(cmd, args, { timeout: 5000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => err && !out ? reject(err) : resolve(out))); // lsof exits 1 on partial results
++      return {
++        panePid: () => tmuxAdapter.getPanePid(sessionName),
++        children: async (pid: number) => (await run("pgrep", ["-P", String(pid)]).catch(() => "")).split("\n").map((x) => Number(x)).filter((n) => Number.isInteger(n) && n > 0),
++        comm: async (pid: number) => (await run("ps", ["-o", "comm=", "-p", String(pid)])).trim(),
++        lsof: (pid: number) => run("lsof", ["-p", String(pid), "-Fn"]),
++      };
++    } });
+   const ompAdapter = new OmpRuntimeAdapter({ tmux: tmuxAdapter, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; } }, stateRoot: ompStateRoot, runnerEntryPath: piRunnerEntryPath });
+   // OPR.0.5.1.1 — the stub runtime adapter (Pi-shaped node-script runner in a pane).
+   // Same fsOps shape as Pi; the compiled runner entry lives in the daemon dist.
+@@ -940,7 +973,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult>
+     db, rigRepo, podRepo,
+     sessionRegistry, eventBus, nodeLauncher, startupOrchestrator,
+     fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), exists: (p: string) => fs.existsSync(p) },
+-    adapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
++    adapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "omp": ompAdapter, "antigravity": antigravityAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
+     tmuxAdapter,
+     agentImageLibrary,
+     continuityPolicyMaterializer,
+@@ -1072,7 +1105,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult>
+   // #421 — the pane's current Claude process start time; a sidecar sampled earlier is not this
+   // process's, so capture and null-fill skip it.
+   const claudeProcessStartedAt = (sessionName: string) => observeClaudePaneStartedAt({ target: sessionName, tmux: tmuxAdapter });
+-  const resumeMetadataRefresher = new ResumeMetadataRefresher({ sessionRegistry, tmuxAdapter, contextUsageStore, claudeProcessStartedAt });
++  const resumeMetadataRefresher = new ResumeMetadataRefresher({ sessionRegistry, tmuxAdapter, contextUsageStore, claudeProcessStartedAt, antigravityConversationReader: antigravityAdapter });
+   const claimService = new ClaimService({
+     db, rigRepo, sessionRegistry, discoveryRepo, eventBus, tmuxAdapter, transcriptStore,
+     claudeContextProvisioner: claudeAdapter,
+@@ -1084,6 +1117,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult>
+     // OPR.0.4.6.PI1 FR-6 — pi-runner sidecar reader (the adapter exposes it).
+     piRunnerStateStore: piAdapter,
+     ompRunnerStateStore: ompAdapter,
++    antigravityConversationReader: antigravityAdapter,
+   });
+   const selfAttachService = new SelfAttachService({
+     db, rigRepo, podRepo, sessionRegistry, eventBus, tmuxAdapter, transcriptStore,
+@@ -1202,7 +1236,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult>
+     }),
+     podInstantiator,
+     podBundleSourceResolver,
+-    runtimeAdapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
++    runtimeAdapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "omp": ompAdapter, "antigravity": antigravityAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
+     transcriptStore,
+     sessionTransport: (() => {
+       const t = new SessionTransport({
+diff --git a/packages/daemon/test/antigravity-conversation-capture.test.ts b/packages/daemon/test/antigravity-conversation-capture.test.ts
+new file mode 100644
+index 0000000..febb5aa
+--- /dev/null
++++ b/packages/daemon/test/antigravity-conversation-capture.test.ts
+@@ -0,0 +1,96 @@
++import { describe, expect, it } from "vitest";
++import { parseLsofConversationIds, readAgyConversationId } from "../src/adapters/antigravity-conversation.js";
++import { deriveResumeToken } from "../src/domain/resume-token-capture.js";
++
++const ID = "bbdd6f6c-7c1c-4899-9f6e-843a3d73de22";
++// `lsof -Fn` shape: one "n<path>" line per open file.
++const lsof = (...names: string[]) => names.map((n) => `n${n}`).join("\n");
++const DIR = "/Users/brandon/.gemini/antigravity-cli/conversations";
++
++describe("parseLsofConversationIds", () => {
++  it("returns the conversation uuid from the open .db/-wal/-shm/.lock, ignoring conversation_summaries", () => {
++    const out = lsof(`${DIR}/${ID}.db`, `${DIR}/${ID}.db-wal`, `${DIR}/${ID}.db-shm`, `${DIR}/conversation_summaries.db`, "/dev/null");
++    expect(parseLsofConversationIds(out)).toEqual([ID]);
++  });
++  it("de-duplicates, and reports every distinct conversation held", () => {
++    const other = "11111111-2222-3333-4444-555555555555";
++    expect(parseLsofConversationIds(lsof(`${DIR}/${ID}.db`, `${DIR}/${other}.db`)).sort()).toEqual([ID, other].sort());
++  });
++  it("garbage / empty => no ids", () => {
++    expect(parseLsofConversationIds("")).toEqual([]);
++    expect(parseLsofConversationIds("nnot-a-conversation.db")).toEqual([]);
++  });
++});
++
++describe("readAgyConversationId", () => {
++  const base = (over: Partial<Parameters<typeof readAgyConversationId>[0]> = {}) => ({
++    panePid: async () => 100,
++    children: async (pid: number) => (pid === 100 ? [200] : []),
++    comm: async (pid: number) => (pid === 200 ? "agy" : "zsh"),
++    lsof: async (pid: number) => (pid === 200 ? lsof(`${DIR}/${ID}.db`) : ""),
++    ...over,
++  });
++  it("finds agy in the pane's process tree (shell -> agy) and returns its conversation id", async () => {
++    expect(await readAgyConversationId(base())).toEqual({ ok: true, conversationId: ID });
++  });
++  it("agy as the pane process itself works too", async () => {
++    expect(await readAgyConversationId(base({ comm: async () => "agy", children: async () => [], lsof: async () => lsof(`${DIR}/${ID}.db`) }))).toEqual({ ok: true, conversationId: ID });
++  });
++  it("no agy process => skip reason, never a guess", async () => {
++    expect(await readAgyConversationId(base({ comm: async () => "zsh" }))).toEqual({ ok: false, reason: "no_agy_process" });
++  });
++  it("agy up but no conversation yet (before the first prompt) => not_yet_created", async () => {
++    expect(await readAgyConversationId(base({ lsof: async () => lsof(`${DIR}/conversation_summaries.db`) }))).toEqual({ ok: false, reason: "not_yet_created" });
++  });
++  it("more than one conversation held => ambiguous, no token", async () => {
++    expect(await readAgyConversationId(base({ lsof: async () => lsof(`${DIR}/${ID}.db`, `${DIR}/11111111-2222-3333-4444-555555555555.db`) }))).toEqual({ ok: false, reason: "ambiguous" });
++  });
++  it("probe errors degrade to a skip, never throw", async () => {
++    expect(await readAgyConversationId(base({ lsof: async () => { throw new Error("lsof missing"); } }))).toMatchObject({ ok: false });
++    expect(await readAgyConversationId(base({ panePid: async () => null }))).toEqual({ ok: false, reason: "no_agy_process" });
++  });
++});
++
++describe("deriveResumeToken for antigravity", () => {
++  it("captures the conversation id via the injected reader", async () => {
++    const r = await deriveResumeToken({ runtime: "antigravity", sessionName: "dev-gem@rig" }, { antigravityConversationReader: { read: async () => ({ ok: true, conversationId: ID }) } });
++    expect(r).toEqual({ outcome: "captured", resumeType: "antigravity_id", token: ID });
++  });
++  it("reader skip => honest skipped; absent reader => noop", async () => {
++    expect(await deriveResumeToken({ runtime: "antigravity", sessionName: "s" }, { antigravityConversationReader: { read: async () => ({ ok: false, reason: "not_yet_created" }) } })).toMatchObject({ outcome: "skipped" });
++    expect(await deriveResumeToken({ runtime: "antigravity", sessionName: "s" }, {})).toEqual({ outcome: "noop" });
++  });
++});
++
++import { vi } from "vitest";
++import { ResumeMetadataRefresher } from "../src/domain/resume-metadata-refresher.js";
++
++describe("ResumeMetadataRefresher antigravity branch (snapshot-time capture)", () => {
++  const mk = (read: () => Promise<{ ok: true; conversationId: string } | { ok: false; reason: string }>) => {
++    const sessionRegistry = { updateResumeToken: vi.fn(), markResumeProbeResult: vi.fn() };
++    const r = new ResumeMetadataRefresher({ sessionRegistry: sessionRegistry as never, tmuxAdapter: {} as never, antigravityConversationReader: { read } });
++    return { r, sessionRegistry };
++  };
++  const session = (resumeToken: string | null) => ({ sessionId: "s1", sessionName: "dev-gem@rig", runtime: "antigravity", resumeToken }) as never;
++
++  it("null-fills the token from the live conversation (scrape provenance)", async () => {
++    const { r, sessionRegistry } = mk(async () => ({ ok: true, conversationId: ID }));
++    await r.refresh([session(null)], { fillNullOnly: true });
++    expect(sessionRegistry.updateResumeToken).toHaveBeenCalledWith("s1", "antigravity_id", ID, "scrape");
++  });
++  it("not yet created / ambiguous => nothing written", async () => {
++    const { r, sessionRegistry } = mk(async () => ({ ok: false, reason: "not_yet_created" }));
++    await r.refresh([session(null)], { fillNullOnly: true });
++    expect(sessionRegistry.updateResumeToken).not.toHaveBeenCalled();
++  });
++  it("a present token is never clobbered; an equal live id re-stamps freshness; a different one is left alone", async () => {
++    const same = mk(async () => ({ ok: true, conversationId: ID }));
++    await same.r.refresh([session(ID)], { fillNullOnly: true });
++    expect(same.sessionRegistry.updateResumeToken).not.toHaveBeenCalled();
++    expect(same.sessionRegistry.markResumeProbeResult).toHaveBeenCalledWith("s1", "resumable");
++    const diff = mk(async () => ({ ok: true, conversationId: "11111111-2222-3333-4444-555555555555" }));
++    await diff.r.refresh([session(ID)], { fillNullOnly: true });
++    expect(diff.sessionRegistry.updateResumeToken).not.toHaveBeenCalled();
++    expect(diff.sessionRegistry.markResumeProbeResult).not.toHaveBeenCalled();
++  });
++});
+diff --git a/packages/daemon/test/antigravity-registration.test.ts b/packages/daemon/test/antigravity-registration.test.ts
+new file mode 100644
+index 0000000..573b81c
+--- /dev/null
++++ b/packages/daemon/test/antigravity-registration.test.ts
+@@ -0,0 +1,9 @@
++// topdrive Phase 1 — "antigravity" is a first-class agent harness value.
++import { describe, it, expect } from "vitest";
++import { WORKFLOW_AGENT_HARNESSES } from "../src/domain/workflow-types.js";
++
++describe("antigravity registration", () => {
++  it("is a pinnable workflow agent harness", () => {
++    expect(WORKFLOW_AGENT_HARNESSES).toContain("antigravity");
++  });
++});
+diff --git a/packages/daemon/test/antigravity-resume.test.ts b/packages/daemon/test/antigravity-resume.test.ts
+new file mode 100644
+index 0000000..c31ea0a
+--- /dev/null
++++ b/packages/daemon/test/antigravity-resume.test.ts
+@@ -0,0 +1,60 @@
++import { describe, expect, it, vi } from "vitest";
++import { AntigravityResumeAdapter } from "../src/adapters/antigravity-resume.js";
++import type { TmuxAdapter } from "../src/adapters/tmux.js";
++
++const ID = "07698086-b5ae-4e6d-af8c-ea8089009391";
++const READY = "Antigravity CLI\n> \n? for shortcuts";
++
++function mk(panes: string[], g1?: boolean | "unknown") {
++  let i = 0;
++  const tmux = {
++    sendShellCommand: vi.fn(async () => ({ ok: true })),
++    capturePaneContent: vi.fn(async () => panes[Math.min(i++, panes.length - 1)] ?? ""),
++    getPaneCommand: vi.fn(async () => "bash"),
++  } as unknown as TmuxAdapter;
++  return { a: new AntigravityResumeAdapter(tmux, { pollMs: 1, maxWaitMs: 50, sleep: async () => {}, ...(g1 !== undefined ? { readUseG1Credits: async () => g1 } : {}) }), tmux };
++}
++
++describe("AntigravityResumeAdapter", () => {
++  it("canResume only for antigravity_id with a token", () => {
++    const { a } = mk([]);
++    expect(a.canResume("antigravity_id", ID)).toBe(true);
++    expect(a.canResume("antigravity_id", null)).toBe(false);
++    expect(a.canResume("codex_id", ID)).toBe(false);
++  });
++  it("relaunches with --conversation <id> (billing scrub kept, no bypass flag by default) and succeeds once the TUI is ready", async () => {
++    const { a, tmux } = mk(["", READY]);
++    expect(await a.resume("dev-gem@rig", "antigravity_id", ID, "/w", "gemini-3.1-pro-high", "floor")).toMatchObject({ ok: true });
++    const cmd = vi.mocked(tmux.sendShellCommand).mock.calls[0]![1] as string;
++    expect(cmd).toContain(`--conversation '${ID}'`);
++    expect(cmd).toContain("env -u GEMINI_API_KEY");
++    expect(cmd).toContain("--model 'gemini-3.1-pro-high'");
++    expect(cmd).not.toContain("--dangerously-skip-permissions");
++  });
++  it("full_bypass posture adds the bypass flag", async () => {
++    const { a, tmux } = mk([READY]);
++    await a.resume("s", "antigravity_id", ID, "/w", null, "full_bypass");
++    expect(vi.mocked(tmux.sendShellCommand).mock.calls[0]![1]).toContain("--dangerously-skip-permissions");
++  });
++  it("trust prompt => attention_required, not failure (operator trusts the folder once)", async () => {
++    const { a } = mk(["Do you trust the contents of this project?"]);
++    expect(await a.resume("s", "antigravity_id", ID, "/w", null)).toMatchObject({ ok: false, code: "attention_required" });
++  });
++  it("never becomes ready => failed with the tail evidence", async () => {
++    const { a } = mk(["booting..."]);
++    expect(await a.resume("s", "antigravity_id", ID, "/w", null)).toMatchObject({ ok: false, code: "resume_not_ready" });
++  });
++  it("a shell-unsafe token is refused before anything is typed", async () => {
++    const { a, tmux } = mk([READY]);
++    expect(await a.resume("s", "antigravity_id", "x; rm -rf /", "/w", null)).toMatchObject({ ok: false });
++    expect(tmux.sendShellCommand).not.toHaveBeenCalled();
++  });
++  it("useG1Credits=true refuses the restore relaunch as attention_required, typing nothing (spec §79)", async () => {
++    const { a, tmux } = mk([READY], true);
++    expect(await a.resume("s", "antigravity_id", ID, "/w", null)).toMatchObject({ ok: false, code: "attention_required", message: expect.stringContaining("useG1Credits") });
++    expect(tmux.sendShellCommand).not.toHaveBeenCalled();
++  });
++  it("false/unknown proceeds", async () => {
++    for (const g1 of [false, "unknown"] as const) expect((await mk([READY], g1).a.resume("s", "antigravity_id", ID, "/w", null)).ok).toBe(true);
++  });
++});
+diff --git a/packages/daemon/test/antigravity-runtime-adapter.test.ts b/packages/daemon/test/antigravity-runtime-adapter.test.ts
+new file mode 100644
+index 0000000..8380f0f
+--- /dev/null
++++ b/packages/daemon/test/antigravity-runtime-adapter.test.ts
+@@ -0,0 +1,140 @@
++import { describe, expect, it, vi } from "vitest";
++import { AntigravityRuntimeAdapter, AGY_CONVERSATIONS_DIR_DEFAULT } from "../src/adapters/antigravity-runtime-adapter.js";
++import type { TmuxAdapter } from "../src/adapters/tmux.js";
++
++const seat = "impl-worker@rig";
++const READY = "Antigravity CLI 1.2.14\n> \n? for shortcuts   Gemini 3.8 Flash · high";
++const TRUST = "Do you trust the contents of this project?\n> Yes, I trust this folder";
++
++function make(opts: { pane?: string; paneCmd?: string; alive?: boolean; files?: string[]; g1?: boolean | "unknown" | Error } = {}) {
++  const files = opts.files ?? [];
++  const writes: Record<string, string> = {};
++  const tmux = {
++    hasSession: vi.fn(async () => opts.alive ?? true),
++    getPaneCommand: vi.fn(async () => opts.paneCmd ?? "agy"),
++    capturePaneContent: vi.fn(async () => opts.pane ?? READY),
++    sendShellCommand: vi.fn(async () => ({ ok: true })),
++    sendText: vi.fn(async () => ({ ok: true })),
++    sendKeys: vi.fn(async () => ({ ok: true })),
++  } as unknown as TmuxAdapter;
++  const fsOps = {
++    readFile: (p: string) => writes[p] ?? "",
++    writeFile: (p: string, c: string) => { writes[p] = c; },
++    exists: () => true,
++    mkdirp: () => {},
++    listFiles: () => files,
++  };
++  const adapter = new AntigravityRuntimeAdapter({ tmux, fsOps, conversationsDir: AGY_CONVERSATIONS_DIR_DEFAULT, sleep: async () => {},
++    ...(opts.g1 !== undefined ? { readUseG1Credits: async () => { if (opts.g1 instanceof Error) throw opts.g1; return opts.g1 as boolean | "unknown"; } } : {}) });
++  return { adapter, tmux, writes };
++}
++const binding = (extra: object = {}) => ({ tmuxSession: seat, cwd: "/work", ...extra }) as never;
++const cmdOf = (tmux: TmuxAdapter) => vi.mocked(tmux.sendShellCommand).mock.calls[0]![1] as string;
++
++describe("AntigravityRuntimeAdapter.launchHarness", () => {
++  it("launches agy fresh, strips API-credential env (billing guard), no bypass flag by default", async () => {
++    const { adapter, tmux } = make();
++    const r = await adapter.launchHarness(binding({ launchPosture: "floor" }), { name: seat });
++    expect(r.ok).toBe(true);
++    const cmd = cmdOf(tmux);
++    expect(cmd).toContain("env -u GEMINI_API_KEY -u GOOGLE_API_KEY");
++    expect(cmd).toMatch(/\bagy\b/);
++    expect(cmd).not.toContain("--dangerously-skip-permissions");
++    expect(cmd).not.toContain("--conversation");
++  });
++  it("adds the bypass flag only for an explicit full_bypass posture", async () => {
++    const { adapter, tmux } = make();
++    await adapter.launchHarness(binding({ launchPosture: "full_bypass" }), { name: seat });
++    expect(cmdOf(tmux)).toContain("--dangerously-skip-permissions");
++  });
++  it("resumes via --conversation <uuid> and returns the same token", async () => {
++    const { adapter, tmux } = make();
++    const id = "07698086-b5ae-4e6d-af8c-ea8089009391";
++    const r = await adapter.launchHarness(binding(), { name: seat, resumeToken: id });
++    expect(r).toMatchObject({ ok: true, resumeToken: id, resumeType: "antigravity_id" });
++    expect(cmdOf(tmux)).toContain(`--conversation '${id}'`);
++  });
++  it("rejects a shell-unsafe resume token before typing anything", async () => {
++    const { adapter, tmux } = make();
++    const r = await adapter.launchHarness(binding(), { name: seat, resumeToken: "x; rm -rf /" });
++    expect(r.ok).toBe(false);
++    expect(tmux.sendShellCommand).not.toHaveBeenCalled();
++  });
++  it("refuses fork and resume+fork", async () => {
++    const { adapter } = make();
++    expect((await adapter.launchHarness(binding(), { name: seat, forkSource: { kind: "native_id", value: "a" } })).ok).toBe(false);
++    expect((await adapter.launchHarness(binding(), { name: seat, resumeToken: "a", forkSource: { kind: "native_id", value: "a" } })).ok).toBe(false);
++  });
++  it("passes model and effort", async () => {
++    const { adapter, tmux } = make();
++    await adapter.launchHarness(binding({ model: "gemini-3.1-pro-high", effort: "high" }), { name: seat });
++    expect(cmdOf(tmux)).toContain("--model 'gemini-3.1-pro-high'");
++    expect(cmdOf(tmux)).toContain("--effort 'high'");
++  });
++});
++
++describe("AntigravityRuntimeAdapter.checkReady", () => {
++  it("ready on the shortcuts footer", async () => {
++    expect(await make().adapter.checkReady(binding())).toEqual({ ready: true });
++  });
++  it("trust gate is an attention-required code", async () => {
++    const r = await make({ pane: TRUST, paneCmd: "bash" }).adapter.checkReady(binding());
++    expect(r).toMatchObject({ ready: false, code: "trust_gate" });
++    expect(r.reason).toContain("trust");
++  });
++  it("a visible ready footer wins even when pane_current_command is a shell (agy runs on the alternate screen; probed: cmd=bash while agy is up)", async () => {
++    expect(await make({ paneCmd: "bash" }).adapter.checkReady(binding())).toEqual({ ready: true });
++  });
++  it("no TUI marker and the pane at a shell => agy exited", async () => {
++    expect(await make({ paneCmd: "zsh", pane: "brandon@host % " }).adapter.checkReady(binding())).toMatchObject({ ready: false, code: "runner_exited" });
++  });
++  it("dead tmux session is not ready", async () => {
++    expect((await make({ alive: false }).adapter.checkReady(binding())).ready).toBe(false);
++  });
++  it("blank pane is awaiting_runtime", async () => {
++    expect(await make({ pane: "" }).adapter.checkReady(binding())).toMatchObject({ ready: false, code: "awaiting_runtime" });
++  });
++});
++
++describe("AntigravityRuntimeAdapter.captureConversationId", () => {
++  it("returns the one new conversation uuid and ignores -shm/-wal", () => {
++    const { adapter } = make({ files: ["old.db", "fe89c4c3-0a5e-49a9-b181-a83b5feff825.db", "fe89c4c3-0a5e-49a9-b181-a83b5feff825.db-wal"] });
++    expect(adapter.captureConversationId(new Set(["old.db"]))).toBe("fe89c4c3-0a5e-49a9-b181-a83b5feff825");
++  });
++  it("returns null when ambiguous or absent (never guesses)", () => {
++    const a = "fe89c4c3-0a5e-49a9-b181-a83b5feff825.db", b = "aaaaaaaa-0a5e-49a9-b181-a83b5feff825.db";
++    expect(make({ files: [a, b] }).adapter.captureConversationId(new Set())).toBeNull();
++    expect(make({ files: [] }).adapter.captureConversationId(new Set())).toBeNull();
++  });
++});
++
++describe("AntigravityRuntimeAdapter.deliverStartup", () => {
++  it("send_text types into the pane and submits", async () => {
++    const { adapter, tmux } = make();
++    const r = await adapter.deliverStartup([{ path: "a.txt", absolutePath: "/a.txt", ownerRoot: "/", deliveryHint: "send_text", required: true, appliesOn: ["fresh_start"] }], binding());
++    expect(r.delivered).toBe(1);
++    expect(tmux.sendText).toHaveBeenCalled();
++    expect(tmux.sendKeys).toHaveBeenCalledWith(seat, ["C-m"]);
++  });
++});
++
++describe("AntigravityRuntimeAdapter paid-credit guard (spec §9, §79)", () => {
++  it("useG1Credits=true blocks the launch (fail closed) with a concrete reason, and types nothing", async () => {
++    const { adapter, tmux } = make({ g1: true });
++    const r = await adapter.launchHarness(binding(), { name: seat });
++    expect(r).toMatchObject({ ok: false, error: expect.stringContaining("useG1Credits") });
++    expect(tmux.sendShellCommand).not.toHaveBeenCalled();
++  });
++  it("blocks resume-by-launch too (same entry point)", async () => {
++    const { adapter, tmux } = make({ g1: true });
++    expect((await adapter.launchHarness(binding(), { name: seat, resumeToken: "07698086-b5ae-4e6d-af8c-ea8089009391" })).ok).toBe(false);
++    expect(tmux.sendShellCommand).not.toHaveBeenCalled();
++  });
++  it("false launches; unknown/unreadable launches (warned elsewhere: doctor), never blocks on a probe failure", async () => {
++    for (const g1 of [false, "unknown", new Error("agy busy")] as const) {
++      const { adapter, tmux } = make({ g1 });
++      expect((await adapter.launchHarness(binding(), { name: seat })).ok).toBe(true);
++      expect(tmux.sendShellCommand).toHaveBeenCalled();
++    }
++  });
++});
+diff --git a/packages/daemon/test/resume-token-validation.test.ts b/packages/daemon/test/resume-token-validation.test.ts
+index 41d6645..6286acf 100644
+--- a/packages/daemon/test/resume-token-validation.test.ts
++++ b/packages/daemon/test/resume-token-validation.test.ts
+@@ -10,6 +10,7 @@ describe("resumeTypeForRuntime", () => {
+     expect(resumeTypeForRuntime("claude-code")).toBe("claude_id");
+     expect(resumeTypeForRuntime("codex")).toBe("codex_id");
+     expect(resumeTypeForRuntime("pi")).toBe("pi_session_file");
++    expect(resumeTypeForRuntime("antigravity")).toBe("antigravity_id");
+     expect(resumeTypeForRuntime("terminal")).toBeNull();
+     expect(resumeTypeForRuntime(null)).toBeNull();
+   });
+@@ -168,3 +169,16 @@ describe("validateResumeToken — pi_session_file (path-shaped, per-type)", () =
+     expect(validateResumeToken("codex", validPath).ok).toBe(false);
+   });
+ });
++
++describe("validateResumeToken antigravity", () => {
++  it("accepts an agy conversation UUID and returns antigravity_id", () => {
++    const r = validateResumeToken("antigravity", "07698086-b5ae-4e6d-af8c-ea8089009391");
++    expect(r.ok).toBe(true);
++    if (r.ok) expect(r.resumeType).toBe("antigravity_id");
++  });
++  it("rejects shell-unsafe tokens without echoing them", () => {
++    const r = validateResumeToken("antigravity", "x; rm -rf /");
++    expect(r.ok).toBe(false);
++    if (!r.ok) expect(r.error).not.toContain("rm -rf");
++  });
++});
+diff --git a/packages/daemon/test/rigspec-preflight.test.ts b/packages/daemon/test/rigspec-preflight.test.ts
+index b417959..1689f1a 100644
+--- a/packages/daemon/test/rigspec-preflight.test.ts
++++ b/packages/daemon/test/rigspec-preflight.test.ts
+@@ -149,6 +149,14 @@ describe("RigSpecPreflight", () => {
+     expect(exec).not.toHaveBeenCalledWith("pi --version");
+   });
+ 
++  it("probes agy for an antigravity legacy rig", async () => {
++    const exec = vi.fn<ExecFn>().mockResolvedValue("");
++    const pf = createPreflight({ exec });
++    const result = await pf.check(validSpec({ nodes: [{ id: "worker", runtime: "antigravity", cwd: "/" }] }));
++    expect(result.ready).toBe(true);
++    expect(exec).toHaveBeenCalledWith("agy --version");
++  });
++
+   it("runtime not available -> error", async () => {
+     const exec = vi.fn<ExecFn>().mockRejectedValue(new Error("not found"));
+     const pf = createPreflight({ exec });
+diff --git a/packages/daemon/test/startup.test.ts b/packages/daemon/test/startup.test.ts
+index fa7632f..3c8b8c1 100644
+--- a/packages/daemon/test/startup.test.ts
++++ b/packages/daemon/test/startup.test.ts
+@@ -58,9 +58,13 @@ describe("createDaemon startup composition", () => {
+   // regardless of the host's runtime-auth state.
+   beforeAll(() => {
+     process.env.OPENRIG_NO_KERNEL = "1";
++    // These tests mock tmux (every command returns ""), which the topdrive billing scrub correctly refuses to
++    // trust (it cannot identify the pane shell). They assert composition, not billing: the guard has its own tests.
++    process.env.TOPDRIVE_BILLING_MODE = "unrestricted";
+   });
+   afterAll(() => {
+     delete process.env.OPENRIG_NO_KERNEL;
++    delete process.env.TOPDRIVE_BILLING_MODE;
+   });
+ 
+   it("calls cmuxAdapter.connect() during startup", async () => {
+diff --git a/packages/daemon/test/topdrive-tmux-scrub.test.ts b/packages/daemon/test/topdrive-tmux-scrub.test.ts
+new file mode 100644
+index 0000000..55d0a0f
+--- /dev/null
++++ b/packages/daemon/test/topdrive-tmux-scrub.test.ts
+@@ -0,0 +1,55 @@
++import { describe, expect, it, vi } from "vitest";
++import { TmuxAdapter } from "../src/adapters/tmux.js";
++
++function adapter(shell = "zsh") {
++  const calls: string[][] = [];
++  const argvExec = vi.fn(async (argv: string[]) => { calls.push(argv); return argv[1] === "display-message" ? `${shell}\n` : ""; });
++  const t = new TmuxAdapter(vi.fn(async () => ""), undefined, argvExec as never);
++  return { t, calls };
++}
++
++describe("TmuxAdapter billing scrub (subscription_only)", () => {
++  it("unsets API-credential env in every freshly created pane shell, after new-session", async () => {
++    const { t, calls } = adapter();
++    t.setEnvScrub(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
++    expect((await t.createSession("s@rig", "/w", { OPENRIG_NODE_ID: "n" })).ok).toBe(true);
++    expect(calls[0]!.slice(0, 3)).toEqual(["tmux", "new-session", "-d"]);
++    const send = calls.find((c) => c[1] === "send-keys")!;
++    expect(send).toEqual(["tmux", "send-keys", "-t", "s@rig", "unset ANTHROPIC_API_KEY OPENAI_API_KEY", "C-m"]);
++  });
++  it("is off by default (existing behavior unchanged)", async () => {
++    const { t, calls } = adapter();
++    await t.createSession("s@rig", "/w");
++    expect(calls.some((c) => c[1] === "send-keys")).toBe(false);
++  });
++  it("only accepts env-var-shaped names (no shell injection through config)", () => {
++    const { t } = adapter();
++    expect(() => t.setEnvScrub(["OK_NAME", "BAD; rm -rf /"])).toThrow(/invalid env name/);
++  });
++  it("a failed scrub fails the launch closed and removes the just-created session (§54)", async () => {
++    const calls: string[][] = [];
++    const argvExec = vi.fn(async (argv: string[]) => { calls.push(argv); if (argv[1] === "send-keys") throw new Error("pane gone"); return argv[1] === "display-message" ? "bash" : ""; });
++    const t = new TmuxAdapter(vi.fn(async () => ""), undefined, argvExec as never);
++    t.setEnvScrub(["OPENAI_API_KEY"]);
++    const r = await t.createSession("s@rig", "/w");
++    expect(r).toMatchObject({ ok: false });
++    expect(calls.some((c) => c[1] === "kill-session" && c.includes("s@rig"))).toBe(true);
++  });
++
++  const sendOf = (calls: string[][]) => calls.find((c) => c[1] === "send-keys")![4];
++  it.each([["bash", "unset A B"], ["-zsh", "unset A B"], ["sh", "unset A B"], ["dash", "unset A B"], ["fish", "set -e A B"], ["nu", "hide-env --ignore-errors A B"]])(
++    "uses the %s dialect to remove variables from the pane shell", async (shell, expected) => {
++      const { t, calls } = adapter(shell);
++      t.setEnvScrub(["A", "B"]);
++      expect((await t.createSession("s@rig", "/w")).ok).toBe(true);
++      expect(sendOf(calls)).toBe(expected);
++    });
++  it("an unknown pane shell fails closed: session removed, launch refused (a scrub that cannot be delivered must not be assumed)", async () => {
++    const { t, calls } = adapter("xonsh");
++    t.setEnvScrub(["A"]);
++    const r = await t.createSession("s@rig", "/w");
++    expect(r.ok).toBe(false);
++    expect(calls.some((c) => c[1] === "kill-session")).toBe(true);
++    expect(calls.some((c) => c[1] === "send-keys")).toBe(false);
++  });
++});
+diff --git a/packages/daemon/test/watchdog-auto-registration.test.ts b/packages/daemon/test/watchdog-auto-registration.test.ts
+index 889fd19..94885e0 100644
+--- a/packages/daemon/test/watchdog-auto-registration.test.ts
++++ b/packages/daemon/test/watchdog-auto-registration.test.ts
+@@ -39,6 +39,10 @@ function seedCanonicalNode(db: Database.Database, rigName = "auto-rig") {
+ }
+ 
+ describe("W2c watchdog auto-registration — production composition", () => {
++  // Mocked tmux returns "" for everything; the topdrive billing scrub refuses to trust that. Not under test here.
++  beforeAll(() => { process.env.TOPDRIVE_BILLING_MODE = "unrestricted"; });
++  afterAll(() => { delete process.env.TOPDRIVE_BILLING_MODE; });
++
+   const originalNoKernel = process.env.OPENRIG_NO_KERNEL;
+   const originalAutoRegister = process.env.OPENRIG_POLICIES_IDLE_GATE_QITEM_AUTO_REGISTER;
+   const tempRoots: string[] = [];

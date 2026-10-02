@@ -1,0 +1,56 @@
+# OpenRig extension map (topdrive Phase 0, COMPLETE)
+
+**Pinned base:** `mvschwarz/openrig` @ `716d13a968ed37b617651da7c95f732b1555d904` (package.json v0.6.3; spec assumed 0.5.x)
+**Clone:** `./openrig` (daemon code in `packages/daemon/src`)
+**Status:** complete. **Superseded for routing:** routing now runs as topdrive, an add-on over OpenRig's stock HTTP API. Only the Antigravity runtime and the API-key scrub still change OpenRig, kept as `openrig-patches/` (see `status.md`). The seam table below is the original in-daemon plan, kept for the record. Every UNVERIFIED item below is closed (see "Phase 0 closing findings"); Phases 1-9 shipped in PRs #1-#3 (see `status.md`). Kept as the record of which OpenRig seams topdrive extends.
+
+## Verified seams (what replaces proposed custom code)
+
+| Spec need | Existing primitive | Evidence | Plan |
+|---|---|---|---|
+| Antigravity runtime (§20-21) | `RuntimeAdapter` interface: `listInstalled, project, deliverStartup, launchHarness, checkReady`. Reference impls: `adapters/pi-runtime-adapter.ts` (runner-in-a-pane, RPC), `omp-runtime-adapter.ts` (an 811-byte shim over the Pi one), `codex-runtime-adapter.ts`, `claude-code-adapter.ts` | `domain/runtime-adapter.ts:132` | New `adapters/antigravity-runtime-adapter.ts`. Register in `startup.ts` (~L748-757, beside `PiRuntimeAdapter`). Add `"antigravity"` to `LEGACY_KNOWN_RUNTIMES` (`domain/rigspec-schema.ts:1186`). Resume side: add an `antigravity-resume.ts` like `pi-resume.ts` / `codex-resume.ts`. |
+| Provider health / quota signals (§11-19) | `domain/provider/` already has `ProviderSignal` (windows, `usedPercent`, `resetsAt`, `automationUse`, explicit unknown rows, no silent zero), `provider-signals.ts`, `provider-collect.ts`, `claude-usage-reader.ts`, `codex-auth-reader.ts`, `host-usage-rollup.ts`, `provider-policy.ts` | `provider/provider-types.ts` | Don't build a parallel quota service. Add `ProviderKind = "codex" \| "claude" \| "google"`, a Google/agy signal reader, and a thin `ProviderHealth` projection (available/draining/cooldown...) derived from `ProviderSignal`. The existing "never fabricate precision" rule matches spec §14. |
+| Role-based routing (§23-30) | `workflow-role-resolver.ts`: pure role→seat selection (gates: agent, running, managed-seat, runtime match, then least-loaded). Also `nodes.role`, `workflow.roles` in the workflow spec, `workflow-role-context.ts` | `domain/workflow-role-resolver.ts` | The spec's "role" already exists. Extend the resolver with new gates: provider health, role-history independence, preference rank. It is documented as pure and determinism-pinned, so new facts must be passed in as pre-materialized inputs and import-audit tests must keep passing. Avoids a separate `RoleEligibilityService`. |
+| Durable workflow (§32) | `workflow-projector.ts`, `workflow-instance-store.ts`, step trails (migration 035), `workflow-types.ts`, `workflow-exception-router.ts` | domain/ | Reuse. Add optional `routing: quota-aware` step metadata. Do not add a state machine. |
+| Watchdogs (§42) | `watchdog-policy-engine.ts`, `watchdog-scheduler.ts`, `policies/*.ts`. A policy is a pure `evaluate(job)` returning send/skip/terminal. The policy name is plain TEXT, enforced in app code (migration 036) | `policies/types.ts` | Add `provider-health-threshold`, `provider-reset`, `workflow-provider-invalid` as new files in `policies/`. No DDL needed. |
+| Queue + handoff (§38) | `queue-repository.ts` (`handoff`, `handoff-and-complete`, outbox staging in-transaction, nudging), `queue-wake-ladder`, `queue-stuck-sweep` | `domain/queue-repository.ts` | `auto-handoff` should compose the existing transactional handoff and write only the routing decision on top. |
+| Restore packets (§37) | `seat-handover-service.ts`, `seat-handover-planner.ts`, `restore-orchestrator.ts`, `rebuild-priming-chain.ts` | grep hits | Resolved: no schema change. Quota failover is a queue handoff; reason and source provider go in the successor qitem body and `evidence_ref` (see closing findings). |
+| SQLite (§57) | Numbered TS migrations in `db/migrations/` (92 files; latest not yet confirmed) | `db/migrations/` | Add `provider_health_events`, `role_executions`, `routing_decisions`. Reuse the existing event bus for health transitions instead of a separate events table if it fits. |
+
+## Corrections to the spec
+1. Base is 0.6.3, not 0.5.x. Re-check any 0.5-era assumptions.
+2. `ProviderKind` is currently `"codex" | "claude"`. Adding `"google"` touches every exhaustive switch (grep before changing).
+3. Roles, role resolution, and provider signals are not greenfield. Phases 4 and 5 shrink to extensions.
+4. OpenRig already ships a Pi/OMP runtime. The Antigravity adapter should copy the runner-in-a-pane pattern only if `agy` has a headless/RPC mode. Otherwise use the Codex/Claude tmux-TUI pattern.
+
+## Phase 0 checklist (all closed)
+- [x] `agy` CLI (v1.2.14, probed locally, see below). `useG1Credits` is read from `agy -p "/config"` (structured, read-only; PR #3).
+
+## `agy` probe results (v1.2.14)
+- **Quota is structured, with no TUI scraping:** `agy -p "/usage" --output-format json` returns, at zero tokens, `command.data.groups[].buckets[]` with `{id, window: "5h"|"weekly", remaining_fraction, reset_time}`. Two groups: "Gemini Models" (`gemini-5h`, `gemini-weekly`) and "Claude and GPT models" (`3p-5h`, `3p-weekly`). This maps directly onto `ProviderSignal` (`window`, `resetsAt`, `usedPercent = 1 - remaining_fraction`, `sourceClass: provider_structured_read`).
+- **Credits:** `agy -p "/credits"` returns `{remaining_credits, upgrade_uri}` (currently 0), so paid-credit state is readable as well.
+- **Headless mode exists:** `--print`, `--output-format stream-json`, `--input-format stream-json` (NDJSON per turn), `--json-schema` (structured output). Role contracts in spec §50 can use `--json-schema`.
+- **Session handling:** `--conversation <id>` resumes, `--continue` resumes the latest, `--model`, `--mode accept-edits|plan`, `--add-dir`, `--sandbox`, `--effort`. Resume token = conversation id (the JSON response carries `conversation_id`).
+- **Auth:** `agy models` succeeds only when logged in, so it works as an auth probe. State is in `~/.antigravitycli` and `~/.gemini/antigravity-cli`.
+- **Permissions:** `userSettings.globalPermissionGrants.allow` in `~/.gemini/config.json` uses the `command(git add)` / `mcp(...)` syntax, consistent with spec §22.
+- **Spec correction:** the spec says to avoid TUI parsing. This is satisfied: quota comes from JSON. Adapter choice: runner-in-a-pane over `stream-json` (Pi pattern) is viable but heavier. A plain tmux TUI seat (Codex/Claude pattern) plus the JSON `/usage` poll is the minimal path.
+- **Caveat:** `agy` runs Claude and GPT-OSS models through Antigravity too (separate `3p-*` quota). Spec §26 provider-level independence should treat "google" as the harness. Per-model-family independence is a policy decision for you.
+- [x] Restore packet schema and extension point: no new fields; see closing findings.
+- [x] Queue handoff transaction internals: `QueueRepository.handoff()` plus the `withinTransaction` hook (PR #2).
+- [x] Workflow step schema keys: roles map onto `actor_role` / `workflow.roles`; `antigravity` added as a `WorkflowAgentHarness`.
+- [x] Env sanitization hook: the allowlist in `startup.ts` plus a fail-closed shell scrub in every managed pane (`adapters/tmux.ts` `setEnvScrub`).
+- [x] Latest migration number: base ended at `092`; topdrive is `093_topdrive`.
+- [x] Baseline (needs `tmux`, installed via brew; tmux 3.7c): build OK; 14,787 tests pass, 3 fail, all environmental. Two are real-codex e2e (`seat-handover-model-fidelity-e2e`, `seat-lifecycle-set-model-resume-e2e`: successor never became ready, so codex CLI or login is missing or mismatched). One is `doctor.test.ts` Node-version check (warn, not pass; local Node newer or older than the pinned range). Expect these 3 to fail before any topdrive change.
+- [x] CONTRIBUTING.md rules: `npm test` runs docs-guard, skills-mirror and context-pack checks; conventional commits.
+
+## Phase 0 closing findings (queue, steps, env, packets)
+- **Queue handoff** (`queue-repository.ts:1634`): one SQLite transaction marks the source `handed-off`, appends a transition-log row, creates the successor qitem (chain_of_record kept) and stages an outbox intent. The destination is `toSession`. So "auto-handoff" = a pure selector that picks `toSession`, then a call to the existing `handoff()`. The routing decision row can be written in the same transaction or immediately after. Never reimplement the handoff.
+- **Workflow steps already have** `harness` (pin to an agent harness; no match = loud routing failure, never silent), `next_hop.suggested_roles`, `next_hop.on` (exit-to-step branching, which gives verify->plan and review->implement loops), `depends_on`, `acceptance`, `host`, `gate`. Unknown keys are rejected (`WORKFLOW_STEP_KEYS`, `workflow-spec-cache.ts:93`). Plan: add `routing: quota-aware` to that key list. The spec's `role:` maps to the existing `workflow.roles` plus step owner resolution. Add `antigravity` to `WorkflowAgentHarness`.
+- **Env / billing guard:** provider auth env is allowlist-injected (`collectAllowlistedProviderAuthEnv`, `startup.ts:254`; `KNOWN_PROVIDER_AUTH_ENV` at L218 already contains `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY`). API keys reach seats only if an operator allowlists them, which is a fail-closed default. Guard = when `billing.mode=subscription_only`, reject any allowlisted name in the API-credential set, add `GEMINI_API_KEY` / `CODEX_API_KEY`, and in the launcher also strip them from the inherited process env (UNVERIFIED: whether tmux seats inherit the daemon env; read `node-launcher.ts` and each adapter's `launchHarness`). `CLAUDE_CODE_OAUTH_TOKEN` is a subscription token, not an API key, so do not block it.
+- **"Restore packet"** in the spec corresponds to OpenRig seat handover (`seat-handover-service/planner`, `restore-orchestrator`, transcript store), which replaces a seat's occupant. The queue handoff (work moves between seats) and seat handover (a seat's occupant changes) are different mechanisms. For a quota failover the correct move is a queue handoff to another seat, plus evidence capture. A seat handover is only needed to restart a crashed seat. The spec's extra restore-packet fields should go in the successor qitem body or `evidence_ref`, not a schema change.
+- **Migrations:** latest is `092_node_effort.ts`; next is `093`. Format is a TS file exporting `{name, sql}` (see 036).
+- **Contribution rules:** `docs/reference/developing.md`, `docs/as-built/arteries.md` (risky areas), `docs/as-built/test-layers.md`; `npm test` includes docs-guard, skills-mirror and context-pack checks; conventional commit prefixes.
+- **Residual items (closed later):** env inheritance is handled by the pane-level scrub regardless of what tmux inherits; `useG1Credits` via `agy /config`; `WorkflowAgentHarness` includes `antigravity`.
+
+## Verdict
+Phase 0 hard stop is cleared for Phase 1 (Antigravity runtime) and Phase 2 (billing guard). Custom code needed is much smaller than the spec implies: one adapter, one Google signal reader, one ProviderHealth projection, three watchdog policies, resolver gates, one auto-handoff composer and three tables.

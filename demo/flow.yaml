@@ -1,0 +1,19 @@
+workflow:
+  id: td-run
+  version: 1
+  objective: "Create the file /tmp/hello.txt containing the single line hello topdrive. Keep it tiny."
+  target: { rig: tdrun }
+  entry: { role: planner }
+  coordination_terminal_turn_rule: hot_potato
+  roles:
+    planner: { preferred_targets: [dev-pln@tdrun] }
+    verifier: { preferred_targets: [dev-sol@tdrun] }
+    implementer: { preferred_targets: [dev-bld@tdrun] }
+    reviewer: { preferred_targets: [dev-sol@tdrun] }
+    approver: { preferred_targets: [dev-sol@tdrun] }
+  steps:
+    - { id: plan, actor_role: planner, objective: "Write a one-line plan in your result note.", allowed_exits: [handoff, failed], next_hop: { mode: require, suggested_roles: [verifier] } }
+    - { id: verify, actor_role: verifier, objective: "Check the plan is sensible; hand off.", allowed_exits: [handoff, failed], next_hop: { mode: require, suggested_roles: [implementer] } }
+    - { id: implement, actor_role: implementer, objective: "Create /tmp/hello.txt containing exactly: hello topdrive", allowed_exits: [handoff, failed], next_hop: { mode: require, suggested_roles: [reviewer] } }
+    - { id: review, actor_role: reviewer, objective: "Run `cat /tmp/hello.txt` and confirm it says hello topdrive; hand off.", allowed_exits: [handoff, failed], next_hop: { mode: require, suggested_roles: [approver] } }
+    - { id: approve, actor_role: approver, objective: "Run `cat /tmp/hello.txt`; finish with exit done if correct.", allowed_exits: [done, failed] }

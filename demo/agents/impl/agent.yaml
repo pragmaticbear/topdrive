@@ -1,0 +1,12 @@
+name: impl
+version: "1.0"
+profiles:
+  default:
+    uses:
+      skills: []
+      guidance: []
+      subagents: []
+resources: {}
+startup:
+  files: []
+  actions: []

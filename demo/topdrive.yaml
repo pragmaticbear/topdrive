@@ -1,0 +1,8 @@
+quota_routing:
+  health:
+    draining_threshold_percent: 1
+    degraded_threshold_percent: 5
+  constraints:
+    verifier_must_differ_from_planner: true
+    reviewer_must_differ_from_implementer: true
+    approver_must_differ_from_implementer: true

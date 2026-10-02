@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.tgz
+*.log
+.DS_Store
+.env
+.env.local
+
+# topdrive state if TOPDRIVE_HOME points inside the repo
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+
+# left over from the OpenRig monorepo layout (local checkouts only)
+packages/

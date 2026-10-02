@@ -1,0 +1,11 @@
+version: "0.2"
+name: tdrun
+pods:
+  - id: dev
+    label: Dev
+    members:
+      - { id: pln, agent_ref: "local:agents/impl", profile: default, runtime: antigravity, cwd: "/tmp" }
+      - { id: sol, agent_ref: "local:agents/impl", profile: default, runtime: codex, cwd: "/tmp" }
+      - { id: bld, agent_ref: "local:agents/impl", profile: default, runtime: antigravity, cwd: "/tmp" }
+    edges: []
+edges: []

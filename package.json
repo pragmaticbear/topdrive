@@ -1,0 +1,43 @@
+{
+  "name": "topdrive",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Limit-aware multi-model routing add-on for a running OpenRig: provider health, independence-preserving failover, subscription-only checks",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pragmaticbear/topdrive.git"
+  },
+  "main": "dist/index.js",
+  "bin": {
+    "topdrive": "dist/main.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/main.js",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "engines": {
+    "node": "^22 || ^24"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "commander": "^13.0.0",
+    "yaml": "^2.8.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
